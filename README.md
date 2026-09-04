@@ -2,209 +2,209 @@
 
 *Built for Groww CODE 2026.*
 
-## The idea, in one sentence
+A watchlist that answers **what on my list is unusual since I last looked** — not another live price table.
 
-A watchlist shouldn't tell you a stock's price — you can get that from a hundred apps. It should tell you **what's different since you personally last looked**, and explain *why* that's worth your attention.
+Groww already tells you a name moved ±5% today. This app is attention triage: an explainable score (plain-English reasons, never a bare number) and a personal **Since you left** feed. Two people watching `AAPL` can see different cards depending on when *each of them* last checked.
 
-Most watchlist clones show a live-updating table. That's a solved problem and a low-value one — you already know prices move every day. The actual product problem is **attention triage**: out of everything on your list, what deserves 10 seconds of your time right now? This app answers that with a scoring engine that's personal (per-user "since you left" diffing, not a global "today's movers" list) and explainable (every score traces to plain-English reasons, never a bare number).
+The app code lives in [`smart-watchlist/`](smart-watchlist/).
 
 ---
 
-## What counts as a "meaningful" change
+## What counts as meaningful
 
-Not `abs(% change) > 5%`. A flat threshold treats a sleepy utility stock and a volatile small-cap identically, and can't distinguish routine drift from a structural event. The engine ([`app/services/scoring.py`](backend/app/services/scoring.py)) combines four independent signals, each contributing an explainable point value:
+Not `abs(% change) > 5%`. A flat 5% treats HDFC Bank and a small-cap the same. The engine in [`scoring.py`](smart-watchlist/backend/app/services/scoring.py) stacks independent signals:
 
 | Signal | Why it matters |
 |---|---|
-| **Volatility-normalized move** | A 2% move is huge for a utility stock and noise for a small-cap. We z-score today's move against *that stock's own* trailing 20-day volatility, not a fixed percentage. |
-| **Volume anomaly** | A price move on 3x normal volume signals real conviction; the same move on thin volume is noise. |
-| **52-week high/low breach** | A structural level, independent of today's percentage move — often the actual reason a move gets talked about. |
-| **Opening gap** | Did the move happen instantly at the open (news-driven) or drift intraday? Different story either way. |
+| **Volatility-normalized move** | Today's % is compared to *this stock's* trailing 20-day daily volatility. |
+| **Volume anomaly** | A move on ~2× usual volume is conviction; the same move on thin volume is noise. |
+| **52-week high / low** | A structural level. Taken from Yahoo's real 52-week range, not from a few polls. |
+| **Opening gap** | Gapped at the open (often news) vs drifted intraday. |
+| **Calendar** | Results or ex-dividend in the next 7 days. |
+| **DMA cross** | Price crossed the 50- or 200-day average vs yesterday's close. Sitting above the 50-day is not an event. |
 
-Scores **stack** (not average) — a stock that gapped down 3%, on 3x volume, at a new 52-week low is far more notable than any one signal alone, and the UI shows exactly which signals fired.
+On top of that global score is a **personal delta**: slow multi-day drift can still matter if *you* have been away.
 
-On top of this **global** score sits a **personal** layer (`score_personal_delta`): even a stock that never had one big single-day move can matter to a user who hasn't checked in two weeks, because moves compound. This is what makes the "Since you left" feed genuinely personal — two users watching the same stock can see different framings depending on when *they* each last looked.
+Volatility and DMA are computed from **daily bars** (last snapshot per UTC day), not 15-second poll ticks. On first add, Yahoo is asked for **~1 year of daily history** so 20-day vol and 200-day DMA are real immediately.
 
-**Cold start honesty**: a newly-added symbol has no volatility/volume history yet. Rather than pretend precision it doesn't have, the engine explicitly falls back to a flat 3% threshold until enough snapshots accumulate (`app/services/stats.py`) — a deliberate simple-over-clever choice; a proper historical backfill is a natural next step, not core to proving the idea.
+**US** tickers work as-is (`AAPL`). **NSE/BSE** need Yahoo suffixes (`RELIANCE.NS`, `TCS.BO`); those prices show in ₹. Stooq has no India coverage — Yahoo alone is used for `.NS` / `.BO`.
+
+---
+
+## Since you left
+
+The digest is empty right after you add a symbol. That is correct: adding is looking. The pointer (`last_seen_at` / `last_seen_price`) is set on add, and again on **Mark as seen** or **Catch up**.
+
+A name appears in the feed only if, *after that pointer*:
+
+1. A scored event fired (vol, volume, 52-week, gap, DMA, …), or
+2. Price drifted enough since *your* last price, or
+3. Results / ex-div fall in the next week and you last looked *before* that week started.
+
+Holdings (`I hold this`) rank above names you only watch, in both the table and the digest.
 
 ---
 
 ## Architecture
 
+API requests never call Yahoo or Stooq. They read `SymbolState`. A background poller keeps that table fresh. Cost scales with **distinct symbols**, not users: 500 people watching `AAPL` is one poll target.
+
 ```
-┌─────────────┐        ┌───────────────────────────────────────┐
-│   React UI  │◄──────►│              FastAPI                   │
-│  (Vite)     │  REST  │  /auth  /watchlist  /digest             │
-└─────────────┘        └───────────────┬─────────────────────────┘
-                                        │ reads only
-                                        ▼
-                              ┌───────────────────┐
-                              │   SymbolState      │  ← the cache: API never
-                              │  (Postgres/SQLite) │    talks to the market
-                              └────────▲───────────┘    data provider directly
-                                       │ writes
-                              ┌────────┴───────────┐
-                              │  Background Poller  │  tiered polling:
-                              │  (thread / worker)  │  hot/warm/cold by
-                              └────────┬───────────┘  watcher count
-                                       │
-                         ┌─────────────┴──────────────┐
-                         ▼                             ▼
-                  ┌─────────────┐              ┌──────────────┐
-                  │   Yahoo      │              │   Stooq       │
-                  │  (primary)   │              │  (fallback)   │
-                  └─────────────┘              └──────────────┘
+┌─────────────┐   REST + JWT    ┌──────────────────────────────┐
+│  React/Vite │ ◄─────────────► │ FastAPI                      │
+│  :5173      │                 │ /auth /watchlist /digest     │
+└─────────────┘                 └───────────────┬──────────────┘
+                                                │ reads only
+                                                ▼
+                                       ┌─────────────────┐
+                                       │  SymbolState    │
+                                       │  SQLite / PG    │
+                                       └────────▲────────┘
+                                                │ writes
+                                       ┌────────┴────────┐
+                                       │ Poller thread   │
+                                       │ (or app.worker) │
+                                       └────────┬────────┘
+                          ┌─────────────────────┴─────────────────────┐
+                          ▼                                           ▼
+                 ┌─────────────────┐                         ┌─────────────────┐
+                 │ Yahoo (primary) │                         │ Stooq (fallback)│
+                 │ keyless chart   │                         │ keyless CSV     │
+                 └─────────────────┘                         └─────────────────┘
 ```
 
-- **Backend**: FastAPI + SQLAlchemy. SQLite by default (zero setup); point `DATABASE_URL` at Postgres for production — the ORM layer doesn't change.
-- **Data providers**: two independent, keyless sources (Yahoo Finance's public chart endpoint, Stooq's CSV endpoint) behind a common `QuoteProvider` interface (`app/services/data_providers/`), so adding a paid provider later is a new class, not a rewrite.
-- **Background poller**: refreshes `SymbolState` on a schedule. Every API read hits this table, never the upstream provider — this is *the* thing that makes reads cheap regardless of how many users are watching.
-- **Frontend**: React (Vite), no framework beyond that — this app's complexity is in the scoring logic, not the UI, so the UI stays plain.
+- **Backend:** FastAPI + SQLAlchemy. SQLite by default (`watchlist.db`). `DATABASE_URL` can point at Postgres with no code change.
+- **Providers:** Yahoo + Stooq behind `QuoteProvider`. Fetched in parallel. Disagree by more than 1.5% → `sources disagree`. Both fail → `delayed`, not a fake live price.
+- **Stale means the quote clock**, not download time: Yahoo `regularMarketTime`, Stooq Date+Time. A Friday close on Saturday shows delayed.
+- **Frontend:** React (Vite). Login/register, then the dashboard. Polls every 20s while the tab is visible. Does not talk to Yahoo or Stooq.
 
----
-
-## How state persists across sessions/devices
-
-Accounts are real (email + password, JWT auth) — not localStorage-only. `WatchlistItem` rows are keyed by `user_id`, so logging in from a different device gives the same list. Each `WatchlistItem` also carries a personal `last_seen_at` / `last_seen_price` pointer, which is *why* the digest is personal rather than global: it's the diff base for that specific user on that specific symbol, updated via `POST /watchlist/{symbol}/seen` when they acknowledge a change.
-
----
-
-## Handling stale, delayed, and conflicting data
-
-This was treated as a first-class requirement, not an afterthought:
-
-- **Two independent sources**, queried on every poll. If they disagree by more than 1.5%, the reading is flagged `flagged_conflict` rather than silently averaged or silently trusted — see `QuoteAggregator.fetch` in [`aggregator.py`](backend/app/services/data_providers/aggregator.py).
-- **Failover**: if the primary (Yahoo) fails, the aggregator falls back to Stooq automatically. If *both* fail, the poller marks `SymbolState.is_stale = True` rather than serving the last good value as if it were live.
-- **Staleness is explicit, not implicit**: every quote carries `updated_at` and `is_stale`, both returned to the frontend, which shows a "delayed" tag rather than presenting old data as current.
-- **A single provider failure never takes down a poll cycle** — each symbol is wrapped in its own try/except in the poller loop.
-
----
-
-## Scaling
-
-- **Cost scales with distinct symbols, not distinct users.** 500 users watching AAPL is one poll target because the poller queries `WatchlistItem` grouped by symbol, not per-user.
-- **Tiered polling**: symbols with ≥5 watchers poll every 15s ("hot"), ≥1 watcher every 60s ("warm"), otherwise every 5 minutes ("cold") — configurable via env vars. Popular symbols stay fresh; unpopular ones don't waste provider quota.
-- **Reads are decoupled from fetches**: the API is a thin read layer over `SymbolState`; it can scale horizontally with zero coordination since it never calls the upstream provider itself.
-- **The poller is a single logical process** by design (avoids duplicate/racing fetches). For a single-instance deployment it runs as a background thread inside the API process (`ENABLE_INPROCESS_POLLER=true`, the default — zero extra setup). For a horizontally-scaled deployment, set that to `false` and run `python -m app.worker` as its own singleton process/container instead, so N API replicas don't each poll redundantly.
-- **In-memory cache, not Redis, by default** — see "where we kept it simple" below.
-
----
-
-## Where we kept things simple (and why)
-
-Being honest about trade-offs, since the brief asks for it explicitly:
-
-- **No Redis.** A `Cache` class (`app/services/cache.py`) exists as a narrow interface (get/set/lock) specifically so a Redis-backed implementation is a drop-in swap later — but for a single-process demo, an in-memory dict has one less moving part to install and explain. This is the single biggest "add complexity later, not now" call in the codebase.
-- **Polling, not WebSocket streaming from the exchange.** True tick-by-tick streaming is the "obvious" scaling answer but is over-engineering for what this app needs: users check a watchlist periodically, not tick-by-tick. Tiered polling gets 90% of the freshness at a fraction of the infrastructure. The provider interface doesn't preclude adding a streaming source later.
-- **SQLite by default.** Runs with zero setup; the ORM makes Postgres a one-line config change (`DATABASE_URL`) with no code changes.
-- **No historical backfill job.** New symbols start with a flat-threshold fallback until enough polls accumulate rather than fetching a year of history up front (slow, and easy to rate-limit against on free APIs).
-
-Where we *did* spend complexity: the scoring engine and the conflict/staleness handling, because those are the actual product differentiators the brief is asking for ("don't build the obvious watchlist").
-
----
-
-## Honesty about testing
-
-This was built and reasoned about, then verified as much as the environment allowed:
-
-- **24 unit tests pass** covering the scoring engine (edge cases: missing data, volatile vs. calm stocks, stacking signals, personal-delta logic) and the provider parsing/aggregator logic (conflict flagging, fallback, staleness) — run `pytest` in `backend/`.
-- **A full HTTP smoke test** (register → add symbol → list → digest → mark-seen → digest-clears → delete → duplicate-blocked → unauthenticated-blocked) passes against a real FastAPI `TestClient`, using a mocked data provider.
-- **What wasn't verified live**: the sandbox this was built in has network egress locked to package registries, so the real calls to Yahoo Finance / Stooq were never exercised against the live internet from here. The parsing logic (`YahooProvider._parse`, `StooqProvider._parse`) is tested against realistic fixture payloads shaped like the real API responses, but if either endpoint's shape has drifted, you may need to adjust the parsing on first real run. Run it locally and it will tell you immediately — provider failures raise a clear, typed `QuoteProviderError` rather than failing silently.
+There are **no market-data API keys**. `JWT_SECRET` signs login tokens; set a real one when `ENV` is not `dev`/`test` or the API will refuse to boot. See [PRODUCT.md](smart-watchlist/PRODUCT.md) for the key story.
 
 ---
 
 ## Running it locally
 
+After clone, go into the app folder:
+
+```powershell
+cd smart-watchlist
+```
+
 ### Backend
 
-```bash
+```powershell
 cd backend
-python3 -m venv .venv && source .venv/bin/activate   # optional but recommended
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-Runs on `http://localhost:8000` with a local SQLite file (`watchlist.db`) and the poller running in-process. Swagger docs at `/docs`.
+macOS / Linux: `source .venv/bin/activate` instead of the `Activate.ps1` line.
 
-Run tests:
-```bash
-pytest
+API: `http://localhost:8000` · Swagger: `http://localhost:8000/docs`
+
+```powershell
+python -m pytest app/tests
 ```
 
 ### Frontend
 
-```bash
+```powershell
 cd frontend
 npm install
-cp .env.example .env    # points at http://localhost:8000 by default
+copy .env.example .env    # Unix: cp .env.example .env
 npm run dev
 ```
 
-Runs on `http://localhost:5173`.
+UI: `http://localhost:5173`
 
 ### Try it
 
-1. Open the frontend, create an account.
-2. Add a few real US tickers (e.g. `AAPL`, `TSLA`, `MSFT`).
-3. Wait ~15–30s (poller cycle) and refresh — prices populate, and any symbol that crosses the meaningful-change bar appears in "Since you left."
-4. Click "Mark as seen" on an entry — it drops out of the digest and the personal `last_seen` pointer advances, so future visits diff from now.
+1. Create an account (email is stored lowercase).
+2. Add `AAPL` or `RELIANCE.NS`. The table fills; **Since you left stays empty** until something changes after you looked.
+3. Toggle **I hold this** on names you own — they rank first.
+4. When a card appears: reasons explain why. **Mark as seen** clears one name; **Catch up** clears the feed.
 
-### Scaling to multiple API instances
+### Multiple API workers
 
-```bash
-# run the poller as its own process:
-ENABLE_INPROCESS_POLLER=false python -m app.worker
-# and scale the API separately:
-ENABLE_INPROCESS_POLLER=false uvicorn app.main:app --workers 4
+```powershell
+$env:ENABLE_INPROCESS_POLLER="false"
+python -m app.worker
+uvicorn app.main:app --workers 4
 ```
 
 ---
 
-## API summary
+## API
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/auth/register` | Create account, returns JWT |
-| POST | `/auth/login` | Login (OAuth2 form), returns JWT |
-| GET | `/auth/me` | Current user |
-| GET | `/watchlist` | List watched symbols with live quotes + personalized delta |
-| POST | `/watchlist` | Add a symbol (validates + warms cache synchronously) |
-| DELETE | `/watchlist/{symbol}` | Remove a symbol |
-| POST | `/watchlist/{symbol}/seen` | Acknowledge — advances the personal "last checked" pointer |
-| GET | `/digest` | Ranked "what changed since you left" feed |
-
-Full interactive docs at `/docs` once running.
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/auth/register` | No | Create account, JWT |
+| POST | `/auth/login` | No | OAuth2 form (`username` = email), JWT |
+| GET | `/auth/me` | Yes | Current user |
+| GET | `/watchlist` | Yes | List + quotes, ranked by holdings then attention |
+| POST | `/watchlist` | Yes | Add symbol (warm Yahoo history unless already cached) |
+| DELETE | `/watchlist/{symbol}` | Yes | Remove |
+| POST | `/watchlist/{symbol}/seen` | Yes | Advance last-seen for one name |
+| POST | `/watchlist/seen-all` | Yes | Catch up — all names |
+| POST | `/watchlist/{symbol}/held` | Yes | `{ "held": true }` — I hold this |
+| GET | `/digest` | Yes | Ranked since-you-left feed |
+| GET | `/health` | No | Liveness |
 
 ---
 
-## Project layout
+## What we kept simple (and why)
+
+The brief asks for honesty about trade-offs:
+
+- **No Redis.** [`cache.py`](smart-watchlist/backend/app/services/cache.py) is an in-memory lock so add and the poller do not double-fetch the same symbol. A Redis swap is a new `Cache` class, not a rewrite.
+- **Polling, not WebSockets.** Users open a watchlist periodically. Live ticks are what Groww Terminal already owns.
+- **SQLite by default.** Zero setup. Postgres is `DATABASE_URL`.
+- **No F&O, VIX, LLM news, licensed NSE feed.** Those need data we do not have, or they clone Groww. The gap we fill is personal catch-up with inspectable reasons.
+
+Complexity went into scoring, last-seen, conflict/staleness, and daily-bar honesty — not a second price table.
+
+---
+
+## Testing
+
+From `smart-watchlist/backend/`:
+
+```powershell
+python -m pytest app/tests
+```
+
+- Unit tests for scoring (vol, 52-week, calendar, DMA crosses, personal delta), daily-bar stats, Yahoo/Stooq parse fixtures, aggregator conflict/fallback/staleness, digest ranking, auth (email case, JWT secret in prod).
+- HTTP smoke test (`TestClient`, mocked quotes): register → add → list → digest empty on add → event after last-seen → mark-seen clears → duplicate 409 → delete → unauthenticated 401.
+
+Parsing is tested against fixture payloads. Yahoo/Stooq can change shape in the wild; failures raise `QuoteProviderError` instead of failing silent.
+
+---
+
+## Layout
 
 ```
-backend/
-  app/
-    main.py                  FastAPI app + lifespan (starts poller)
-    worker.py                standalone poller process for scaled deployments
-    config.py                all tunables, env-driven
-    models.py / schemas.py   SQLAlchemy ORM / Pydantic
-    auth.py                  JWT + password hashing
-    routers/                 auth, watchlist, digest endpoints
+smart-watchlist/
+  backend/app/
+    main.py                 FastAPI, CORS, poller lifespan, JWT secret check
+    worker.py               standalone poller
+    config.py               env tunables
+    db.py                   SQLite/Postgres + column migrate
+    models.py / schemas.py
+    auth.py                 JWT, bcrypt (72-byte cap), lowercase email
+    routers/                auth, watchlist, digest
     services/
-      scoring.py             the meaningful-change engine (core logic)
-      stats.py                rolling volatility/volume/52w baselines
-      poller.py               background refresh loop, tiered by popularity
-      cache.py                in-memory TTL cache (Redis-swappable interface)
-      data_providers/
-        base.py               provider interface
-        yahoo.py / stooq.py   two independent keyless sources
-        aggregator.py         conflict/fallback/staleness reconciliation
-    tests/                    24 unit tests
-frontend/
-  src/
-    api/client.js             typed fetch wrapper
-    context/AuthContext.jsx   JWT session state
-    pages/                    AuthPage, Dashboard
-    components/
-      ChangeFeed.jsx           "Since you left" hero
-      WatchlistTable.jsx       full reference table
-      AddSymbolForm.jsx
+      scoring.py            attention score + calendar + DMA
+      stats.py              daily-bar vol/volume/DMA
+      poller.py             warm 1y Yahoo history, trim, lock
+      cache.py              in-process fetch lock
+      symbols.py            AAPL vs RELIANCE.NS
+      data_providers/       yahoo, stooq, aggregator
+    tests/
+  frontend/src/
+    api/client.js           REST + Bearer; 401 logs out
+    context/AuthContext.jsx
+    pages/                  AuthPage, Dashboard
+    components/             ChangeFeed, WatchlistTable, AddSymbolForm
 ```

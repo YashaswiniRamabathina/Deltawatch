@@ -2,6 +2,8 @@
 
 *Built for Groww CODE 2026.*
 
+GitHub shows this same write-up at the [repository root](../README.md). The commands below assume you are already in this folder.
+
 A watchlist that answers **what on my list is unusual since I last looked** — not another live price table.
 
 Groww already tells you a name moved ±5% today. This app is attention triage: an explainable score (plain-English reasons, never a bare number) and a personal **Since you left** feed. Two people watching `AAPL` can see different cards depending on when *each of them* last checked.
